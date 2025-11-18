@@ -2,338 +2,283 @@
 
 
 /*
-
-for timimg for the ultrasonic: the input triggers one interrupt on a rising edge. 
-the ISR records the current time /starts a timer and either puts it into a global variable
-or puts it into dma memory or something
-the input triggers another interrupt on a falling edge
-this interrupt handler records the current time, then subtracts the last current time from this the current time 
-and we have the time that the pin was high. 
-maybe use pulseIn? from wiring_pulse.c
-
+ultrasonic, tilt, and light sensors. 
 */
-// this should be triggered by a timer that goes off every 5 seconds
-struct timeval tv_rising_edge;
-struct timeval tv_falling_edge;
-int64_t time_rising_edge;
-int64_t time_falling_edge;
-int64_t time_echo;
-uint32_t offset = 0;
-int isr_index = 0;
-int time_arr[] = {};
+
+// ----------------------------------- GLOBAL VARIABLES  --------------------------------//
+int ldr_state = 2; // start out assuming dim, the in-between value
+int ultrasonic_state = 0; 
+int tilt_state = 0;
+hw_timer_t* timer0 = nullptr;           // 50 Hz tick ??
 
 
-hw_timer_t* ultrasonic_timer = nullptr;           // 50 Hz tick ??
-hw_timer_t* ultrasonic_backup_timer = nullptr;    
+int ldr(int);
+int ultrasonic(int, int);
+void ultrasonic_ldr_isr();
+void ultrasonic_init();
+void ldr_init();
+void tilt_init();
+void timer0_init();
+void sensors_loop();
+
+
+// this is edge triggered and will not use many arduino functions
+void tilt_isr(void* arg){
+  uint32_t gpio_num = (uint32_t) arg;
+  gpio_num_t gpio_numT = (gpio_num_t)gpio_num;
+
+  // int level = digitalRead((int)gpio_num); // another option: use the arduino logic
+  int level = gpio_get_level(gpio_numT); // check and see what the level is 
+
+  // 4 bit val goes like FRONT | BACK | LEFT | RIGHT
+  if(level == HIGH){
+    if(gpio_numT == TILT_PIN_R) {
+      tilt_state |= 1;
+    } else if(gpio_numT == TILT_PIN_L) {
+      tilt_state |= (1 << 1);
+    } else if(gpio_numT == TILT_PIN_B) {
+      tilt_state |= (1 << 2);
+    } else if(gpio_numT == TILT_PIN_F) {
+      tilt_state |= (1 << 3);
+    }
+  }
+
+  else if(level == LOW){
+    if(gpio_numT == TILT_PIN_R) {
+      tilt_state &= ~(1 << 0);
+    } else if(gpio_numT == TILT_PIN_L) {
+      tilt_state &= ~(1 << 1);
+    } else if(gpio_numT == TILT_PIN_F) {
+      tilt_state &= ~(1 << 2);
+    } else if(gpio_numT == TILT_PIN_B) {
+      tilt_state &= ~(1 << 3);
+    }
+  }
+
+}
+
+
+
+// this is timer triggered and will run after the ultrasonics, in a similar way
+int ldr(int pin_num)
+{
+  int ldr_value = 0; // value read from the ldr
+  float ldr_voltage = 0.00;
+  int ldr_state_next = 0;
+
+  ldr_value = analogRead(pin_num);
+  ldr_voltage = float(ldr_value) * 5.00 / 1023.00;
+  Serial.print("ldr voltage = ");
+  Serial.println(ldr_voltage);
+
+
+  if(ldr_state == 1){ // very dim
+    if(ldr_voltage < (BRIGHT - LDR_BUFFER)) {
+      ldr_state_next = 4; // BRIGHT
+    } else if(ldr_voltage < (VERY_DIM - LDR_BUFFER)){
+      ldr_state_next = 2; // dim
+    } else{
+      ldr_state_next = 1; // very dim
+    }
+    
+  } else if (ldr_state == 2) { // dim
+    if(ldr_voltage < (BRIGHT - LDR_BUFFER)) {
+      ldr_state_next = 4;
+    } else if (ldr_voltage > (VERY_DIM + LDR_BUFFER)){
+      ldr_state_next = 1;
+    } else {
+      ldr_state_next = 2;
+    }
+    
+  } else if(ldr_state == 4){ // BRIGHT
+    if(ldr_voltage > (VERY_DIM + LDR_BUFFER)){
+      ldr_state_next = 1;
+    } else if(ldr_voltage > (BRIGHT + LDR_BUFFER)) {
+      ldr_state_next = 2;
+    } else{
+      ldr_state_next = 4;
+    }
+  }
+  
+
+  return ldr_state_next;
+}
 
 
 
 
 
-      
+int ultrasonic(int TRIG_PIN, int ECHO_PIN){
+
+  float timing = 0.0;
+  float distance = 0.0; 
+  int buffer = 2;
+
+  int next_ultrasonic_state = 0;
+
+  // trigger the ultrasonic in order to get a measurement
+  digitalWrite(TRIG_PIN, LOW);
+  delay(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delay(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // get the input from the echo pin
+  timing = pulseIn(ECHO_PIN, HIGH);
+  distance = (timing * 0.034) /(2*2.54);
+  distance *= 10/8.85; // adjust for accuracy
+
+  // beginning state
+  if(ultrasonic_state == 0){
+    if(distance <= 12){
+      next_ultrasonic_state = 1; // far
+    } else if((distance > 12) && (distance < 24)){
+      next_ultrasonic_state = 2; // close
+    } else if(distance > 24){
+      next_ultrasonic_state = 4; // far
+    } 
+     
+  } 
+  // very close 
+  else if(ultrasonic_state == 1){
+    if(distance > (24 + 2)) {
+     next_ultrasonic_state = 4; // far
+    } else if(distance > (12 + buffer)) {
+      next_ultrasonic_state = 2; // close
+    }else {
+      next_ultrasonic_state = 1; // very close 
+    }
+  }
+  // clBUFFER2ose 
+  else if(ultrasonic_state == 2) {
+    if(distance > (24 + buffer)) {
+      next_ultrasonic_state = 4;
+    } else if(distance < (12 - buffer)){
+      next_ultrasonic_state = 1;
+    } else {
+      next_ultrasonic_state = 2;
+    }
+  }
+  // far
+  else if(ultrasonic_state == 4) {
+    if (distance < (12 - buffer)){
+      next_ultrasonic_state = 1; // transition to very close
+    } else if (distance < (24 - buffer)){
+      next_ultrasonic_state = 2; // transition to close
+    } else {
+      next_ultrasonic_state = 4; // stay the same
+    }
+    
+  }
+
+  ultrasonic_state = next_ultrasonic_state;
+
+  // Serial.print("Distance : ");
+  // Serial.print(distance);
+  // Serial.print(" in.  | ultrasonic state: ");
+  // Serial.println(ultrasonic_state);
+
+  // if(distance < 1) {
+  //   Serial.println("Ouch! Stop hitting me!");
+  // }  
+
+  return ultrasonic_state;
+}
+ 
 
 
-// could possibly set the SAME timer, but then that timer gets reduced to a shorter period of time
-// void ultrasonic_backup_timer_init(){
-//     ultrasonic_backup_timer = timerBegin(0, 80, true); // guessing this brings it down to 1 us?
-//     timerAttachInterrupt(ultrasonic_backup_timer, &ultrasonic_trig_isr, true);
-//     timerAlarmWrite(ultrasonic_backup_timer, 1000*1000, true);
-//     timerAlarmEnable(ultrasonic_backup_timer); 
-// }
+
+void ultrasonic_ldr_isr(){
+  // call the ultrasonic function and get the value
+  // call it for L1 pins
+  int L1_ultrasonic_state = 0;
+  int L2_ultrasonic_state = 0;
+  int R1_ultrasonic_state = 0;
+  int R2_ultrasonic_state = 0;
+
+  L1_ultrasonic_state = ultrasonic(TRIG_PIN_L1, ECHO_PIN_L1);
+  R1_ultrasonic_state = ultrasonic(TRIG_PIN_R1, ECHO_PIN_R1);
+
+  // the order is L2 | R2 | L1 | R1, MSB is L2
+  ultrasonic_state = (L1_ultrasonic_state << 3) | (R1_ultrasonic_state ) | (L2_ultrasonic_state << 9) | (R2_ultrasonic_state << 6); // update the state
+  
+  int ldr1_state = ldr(LDR_PIN1);
+  int ldr2_state = ldr(LDR_PIN2);
+  ldr_state = (ldr1_state << 3) | ldr2_state;
 
 
 
-void ultrasonic_timer_init(){
-    // add an interrupt hadnler
-    // make the ultrasonic_trig_isr the interrupt handler
+  
+  // arm the alarm for 1,5, or 10 seconds 
+  int target = 1; // in seconds
+  timerAlarmWrite(timer0, 1000*1000 * target, true); // in us
+  timerAlarmEnable(timer0);
+
+}
+
+void timer0_init(){
+    // add an interrupt handler
+    // make the ultrasonic_ldr_isr the interrupt handler
     // set the alarm for 1 or 5 seconds
 
-    ultrasonic_timer = timerBegin(0, 80, true); // guessing this brings it down to 1 us?
-    timerAttachInterrupt(ultrasonic_timer, &ultrasonic_trig_isr, true);
-    timerAlarmWrite(ultrasonic_timer, 1000*1000, true);
-    timerAlarmEnable(ultrasonic_timer);
-    // arm the alarm
-    // timerStart();
-    // timerStop();
-    // timerRead();
-
-    // gptimer_handle_t gptimer = NULL;
-    // gptimer_config_t timer_config = {
-    //     .clk_src = GPTIMER_CLK_SRC_DEFAULT, // Select the default clock source
-    //     .direction = GPTIMER_COUNT_UP,      // Counting direction is up
-    //     .resolution_hz = 1 * 1000 * 1000,   // Resolution is 1 MHz, i.e., 1 tick equals 1 microsecond
-    // };
-    // // Create a timer instance
-    // ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
-    // // Enable the timer
-    // ESP_ERROR_CHECK(gptimer_enable(gptimer));
-    // // Start the timer
-    // ESP_ERROR_CHECK(gptimer_start(gptimer));
-  // Timer (unchanged) ...
-}
-
-void ultrasonic_trig_isr() {
-    // send a 10us pulse
-    isr_index = isr_index % 4 + 1; // increment index here, NOT the echo isr, in case the echo isr doesnt get called
-
-    gpio_num_t TRIG_PIN;
-    // decides which ultrasonic sensor to trigger 
-    if (isr_index == 1) TRIG_PIN = TRIG_PIN_L1;
-    if (isr_index == 2) TRIG_PIN = TRIG_PIN_L2;
-    if (isr_index == 3) TRIG_PIN = TRIG_PIN_R1;
-    if (isr_index == 4) TRIG_PIN = TRIG_PIN_R2;
-    
-    gpio_set_level(TRIG_PIN, 1);
-    delayMicroseconds(10); // maybe should change this to another interrupt??
-    gpio_set_level(TRIG_PIN_L1, 0);
-    timerAlarmWrite(ultrasonic_timer, 1000*1000* 30, true); // arm the timer for 30 seconds to try again on a different ultrasonic 
+    timer0 = timerBegin(0, 80, true); // guessing this brings it down to 1 us?
+    timerAttachInterrupt(timer0, &ultrasonic_ldr_isr, true);
+    timerAlarmWrite(timer0, 1000*1000, true);
+    timerAlarmEnable(timer0);
 
 }
 
 
-//if the echo never receives a falling edge pulse, the ultrasonic never arms the alarm and sends another trig pulse
-// we need a timer to tell us if the ultrasonic 
-
-
-void ultrasonic_echo_isr(void* arg){
-    
-    // from https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/system_time.html   
-    uint32_t gpio_num = (uint32_t) arg; // check and see which pin triggered this interrupt
-    int level = gpio_get_level((gpio_num_t)gpio_num); // check and see what the level is 
-
-    if (level == 1) {
-        // start the timer, essentially
-        gettimeofday(&tv_rising_edge, NULL);
-        time_rising_edge = (int64_t)tv_rising_edge.tv_sec * 1000000L + (int64_t)tv_rising_edge.tv_usec;
-
-    }
-    if(level == 0){
-        // stop the timer, essentially
-        gettimeofday(&tv_falling_edge, NULL);
-        time_falling_edge = (int64_t)tv_falling_edge.tv_sec * 1000000L + (int64_t)tv_falling_edge.tv_usec;
-        time_echo = time_rising_edge = time_falling_edge; // get high time
-        // put the value into the right value in the array
-        time_arr[isr_index] = time_echo;
-        // incrememt the index for next time: index is from 1-4
-       
-        int target; // ms to wait before calling the next function 
-        int big_wait = 5; // number of seconds to wait between each set of measurements 
-        if (isr_index == 4) {target = 1000 * big_wait;}
-        else { target = 10;} // wait 10ms before the trigger interrupt is called
-        timerAlarmWrite(ultrasonic_timer, 1000* target, true);  // arm the alarm
-    }
-}
-
-
-// initialises the Ultrasonics to be GPIO
-
-void ultrasonic_init(){
-    gpio_config_t trig_conf = {};
-    //disable interruspt
-    trig_conf.intr_type = GPIO_INTR_DISABLE;
-    //set as output mode
-    trig_conf.mode = GPIO_MODE_OUTPUT;
-    //bit mask of the pins that you want to set,e.g.GPIO18/19
-    trig_conf.pin_bit_mask = ULTRASONIC_OUTPUT_MASK;
-    //disable pull-down mode
-    trig_conf.pull_down_en = GPIO_PULLDOWN_DISABLE; // maybe enable the pulldowns??
-    //disable pull-up mode
-    trig_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    //configure GPIO with the given settings
-    gpio_config(&trig_conf);
-
-    gpio_config_t echo_conf = {};
-    echo_conf.intr_type = GPIO_INTR_ANYEDGE;
-    //bit mask of the pins, use GPIO4/5 here
-    echo_conf.pin_bit_mask = ULTRASONIC_INPUT_MASK;
-    //set as input mode
-    echo_conf.mode = GPIO_MODE_INPUT;
-    //enable pull-up mode
-    echo_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    echo_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
-    gpio_config(&echo_conf);
-
-    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT); // allows per-pin GPIO interrupts
-    gpio_isr_handler_add(ECHO_PIN_L1, ultrasonic_echo_isr, (void*) ECHO_PIN_L1);
-    // just get one working for now, then add the others
-    
-    // gpio_isr_handler_add(TRIG_PIN_L2, gpio_isr_handler, (void*) TRIG_PIN_L2);
-    // gpio_isr_handler_add(TRIG_PIN_R1, gpio_isr_handler, (void*) TRIG_PIN_R1);
-    // gpio_isr_handler_add(TRIG_PIN_R2, gpio_isr_handler, (void*) TRIG_PIN_R2);
-    
-    gpio_intr_enable(ECHO_PIN_L1);// not sure we need this
-
-
-    // set all the TRIG pins low, initially
-    gpio_set_level(TRIG_PIN_L1, 0);
-    gpio_set_level(TRIG_PIN_R1, 0);
-    gpio_set_level(TRIG_PIN_L2, 0);
-    gpio_set_level(TRIG_PIN_R2, 0);
-
-    // xTimerStartFromISR();
-
-}
-
-
-// initialises the LDRs to be initialised for ADC
-void ldr_init(){
-
-
-}
-
-
-// triggered on a timer, every 5 seconds
-// updates the LED output
-void ldr_isr(){
-
-
-}
-
-// initialises the tilt sensors ti be GPIO inputs
-// triggers an ISR on a rising edge 
-// 
 void tilt_init(){
+  pinMode(TILT_PIN_B, INPUT);
+  pinMode(TILT_PIN_F, INPUT);
+  pinMode(TILT_PIN_L, INPUT);
+  pinMode(TILT_PIN_R, INPUT);
+
+  // attachInterrupt(digitalPinToInterrupt(TILT_PIN_B), tilt_isr(TILT_PIN_B), (RISING | FALLING) ); // not sure this will work
+  // attachInterrupt(digitalPinToInterrupt(TILT_PIN_F), tilt_isr, (RISING | FALLING) ); // not sure this will work
+  // attachInterrupt(digitalPinToInterrupt(TILT_PIN_R), tilt_isr, (RISING | FALLING) ); // not sure this will work
+  // attachInterrupt(digitalPinToInterrupt(TILT_PIN_L), tilt_isr, (RISING | FALLING) ); // not sure this will work
+  
+  gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+  gpio_isr_handler_add(TILT_PIN_B, tilt_isr, (void*) TILT_PIN_F);
+  gpio_isr_handler_add(TILT_PIN_B, tilt_isr, (void*) TILT_PIN_B);
+  gpio_isr_handler_add(TILT_PIN_B, tilt_isr, (void*) TILT_PIN_R);
+  gpio_isr_handler_add(TILT_PIN_B, tilt_isr, (void*) TILT_PIN_L);
 
 }
 
+void ultrasonic_init() {
+  pinMode(ECHO_PIN_L1, INPUT);
+  pinMode(ECHO_PIN_R1, INPUT);
+  pinMode(ECHO_PIN_L2, INPUT);
+  pinMode(ECHO_PIN_R2, INPUT);
 
+  pinMode(TRIG_PIN_L1, OUTPUT);
+  pinMode(TRIG_PIN_R1, OUTPUT);
+  pinMode(TRIG_PIN_L2, OUTPUT);
+  pinMode(TRIG_PIN_R2, OUTPUT);
 
-void tilt_isr(){
+  digitalWrite(TRIG_PIN_L1, LOW);
+  digitalWrite(TRIG_PIN_R1, LOW);
+  digitalWrite(TRIG_PIN_L2, LOW);
+  digitalWrite(TRIG_PIN_R2, LOW);
 
 
 }
 
+void ldr_init() {
+  pinMode(LDR_PIN1, INPUT);
+  pinMode(LDR_PIN2, INPUT);
+}
 
 
+// when the gold lead is tilted DOWN, the circuit closes. 
+void sensors_loop() {
 
+  ldr_init();
+  ultrasonic_init();
+  tilt_init();
+  timer0_init();
 
-
-
-
-
-
-/*
- * SPDX-FileCopyrightText: 2020-2025 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
-
-
-/**
- * Brief:
- * This test code shows how to configure gpio and how to use gpio interrupt.
- *
- * GPIO status:
- * GPIO_OUTPUT_IO_0: output
- * GPIO_OUTPUT_IO_1: output
- * GPIO_INPUT_IO_0:  input, pulled up, interrupt from rising edge and falling edge
- * GPIO_INPUT_IO_1:  input, pulled up, interrupt from rising edge.
- *
- * Note. You can check the default GPIO pins to be used in menuconfig, and the IOs can be changed.
- *
- * Test:
- * Connect GPIO_OUTPUT_IO_0 with GPIO_INPUT_IO_0
- * Connect GPIO_OUTPUT_IO_1 with GPIO_INPUT_IO_1
- * Generate pulses on GPIO_OUTPUT_IO_0/1, that triggers interrupt on GPIO_INPUT_IO_0/1
- *
- */
-
-// #define GPIO_OUTPUT_IO_0    CONFIG_GPIO_OUTPUT_0
-// #define GPIO_OUTPUT_IO_1    CONFIG_GPIO_OUTPUT_1
-// #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1))
-// /*
-//  * Let's say, GPIO_OUTPUT_IO_0=18, GPIO_OUTPUT_IO_1=19
-//  * In binary representation,
-//  * 1ULL<<GPIO_OUTPUT_IO_0 is equal to 0000000000000000000001000000000000000000 and
-//  * 1ULL<<GPIO_OUTPUT_IO_1 is equal to 0000000000000000000010000000000000000000
-//  * GPIO_OUTPUT_PIN_SEL                0000000000000000000011000000000000000000
-//  * */
-// #define GPIO_INPUT_IO_0     CONFIG_GPIO_INPUT_0
-// #define GPIO_INPUT_IO_1     CONFIG_GPIO_INPUT_1
-// #define GPIO_INPUT_PIN_SEL  ((1ULL<<GPIO_INPUT_IO_0) | (1ULL<<GPIO_INPUT_IO_1))
-// /*
-//  * Let's say, GPIO_INPUT_IO_0=4, GPIO_INPUT_IO_1=5
-//  * In binary representation,
-//  * 1ULL<<GPIO_INPUT_IO_0 is equal to 0000000000000000000000000000000000010000 and
-//  * 1ULL<<GPIO_INPUT_IO_1 is equal to 0000000000000000000000000000000000100000
-//  * GPIO_INPUT_PIN_SEL                0000000000000000000000000000000000110000
-//  * */
-// #define ESP_INTR_FLAG_DEFAULT 0
-
-// static QueueHandle_t gpio_evt_queue = NULL;
-
-// static void IRAM_ATTR gpio_isr_handler(void* arg)
-// {
-//     uint32_t gpio_num = (uint32_t) arg;
-//     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
-// }
-
-// static void gpio_task_example(void* arg)
-// {
-//     uint32_t io_num;
-//     for (;;) {
-//         if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-//             printf( "GPIO[%"PRIu32"] intr, val: %d\n", io_num, gpio_get_level((gpio_num_t)io_num));
-//         }
-//     }
-// }
-
-// void app_main(void)
-// {
-//     //zero-initialize the config structure.
-//     gpio_config_t io_conf = {};
-//     //disable interrupt
-//     io_conf.intr_type = GPIO_INTR_DISABLE;
-//     //set as output mode
-//     io_conf.mode = GPIO_MODE_OUTPUT;
-//     //bit mask of the pins that you want to set,e.g.GPIO18/19
-//     io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
-//     //disable pull-down mode
-//     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-//     //disable pull-up mode
-//     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-//     //configure GPIO with the given settings
-//     gpio_config(&io_conf);
-
-//     //interrupt of rising edge
-//     io_conf.intr_type = GPIO_INTR_POSEDGE;
-//     //bit mask of the pins, use GPIO4/5 here
-//     io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
-//     //set as input mode
-//     io_conf.mode = GPIO_MODE_INPUT;
-//     //enable pull-up mode
-//     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-//     gpio_config(&io_conf);
-
-//     //change gpio interrupt type for one pin
-//     gpio_set_intr_type(GPIO_INPUT_IO_0, GPIO_INTR_ANYEDGE);
-
-//     //create a queue to handle gpio event from isr
-//     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
-//     //start gpio task
-//     xTaskCreate(gpio_task_example, "gpio_task_example", 2048, NULL, 10, NULL);
-
-//     //install gpio isr service
-//     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
-//     //hook isr handler for specific gpio pin
-//     gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_handler, (void*) GPIO_INPUT_IO_0);
-//     //hook isr handler for specific gpio pin
-//     gpio_isr_handler_add(GPIO_INPUT_IO_1, gpio_isr_handler, (void*) GPIO_INPUT_IO_1);
-
-//     //remove isr handler for gpio number.
-//     gpio_isr_handler_remove(GPIO_INPUT_IO_0);
-//     //hook isr handler for specific gpio pin again
-//     gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_handler, (void*) GPIO_INPUT_IO_0);
-
-
-//     printf("Minimum free heap size: %"PRIu32" bytes\n", esp_get_minimum_free_heap_size());
-
-//     int cnt = 0;
-//     while (1) {
-//         printf("cnt: %d\n", cnt++);
-//         vTaskDelay(1000 / portTICK_PERIOD_MS);
-//         gpio_set_level(GPIO_OUTPUT_IO_0, cnt % 2);
-//         gpio_set_level(GPIO_OUTPUT_IO_1, cnt % 2);
-//     }
-// }
+}
