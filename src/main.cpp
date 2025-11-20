@@ -24,7 +24,7 @@ enum UiState { UI_MAIN, UI_SETTINGS, UI_ALERT };   // add UI_ALERT
 volatile UiState ui = UI_MAIN;           // update your existing declaration
 
 // Cooldown after user acknowledges (10 minutes)
-const uint32_t FALL_COOLDOWN_MS = 10UL * 60UL * 1000UL;
+const uint32_t FALL_COOLDOWN_MS = 1UL * 60UL * 1000UL;
 uint32_t fallCooldownUntilMs = 0;
 
 // Simple debounce: require sustained HIGH for this long to trigger
